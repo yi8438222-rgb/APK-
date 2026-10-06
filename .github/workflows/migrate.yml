@@ -3,10 +3,10 @@ name: PES2021 CN功能合并
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Release标签，例如 v1.0"
+      release_title:
+        description: "Release标题"
         required: true
-        default: "v1.0"
+        default: "PES2021 APK源码"
         type: string
       bundle_name:
         description: "Release里的A+B压缩包文件名"
@@ -68,25 +68,35 @@ jobs:
           echo "[OK] 项目代码准备完成"
           find config scripts -maxdepth 2 -type f | sort
 
-      - name: 从Release下载A+B压缩包
+      - name: 按Release标题自动找到版本并下载A+B压缩包
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
           BUNDLE_NAME: ${{ inputs.bundle_name }}
+        shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p runtime_inputs bundle_unpack
 
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "$BUNDLE_NAME" \
-            --clobber \
-            --dir runtime_inputs
+          RELEASES=$(gh release list             --repo "$GITHUB_REPOSITORY"             --limit 20             --json name,tagName,isDraft,isPrerelease)
+
+          RELEASE_TAG=$(echo "$RELEASES" | jq -r --arg title "$RELEASE_TITLE"             '.[] | select(.name == $title and .isDraft == false and .isPrerelease == false) | .tagName'             | head -n 1)
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "ERROR: 找不到标题为 [$RELEASE_TITLE] 的已发布 Release"
+            echo "当前可见 Release："
+            echo "$RELEASES" | jq -r '.[] | "title=\(.name) | tag=\(.tagName) | draft=\(.isDraft) | prerelease=\(.isPrerelease)"'
+            exit 1
+          fi
+
+          echo "[OK] 找到 Release: $RELEASE_TITLE"
+          echo "[OK] Release Tag: $RELEASE_TAG"
+
+          gh release download "$RELEASE_TAG"             --repo "$GITHUB_REPOSITORY"             --pattern "$BUNDLE_NAME"             --clobber             --dir runtime_inputs
 
           test -f "runtime_inputs/$BUNDLE_NAME"
-
-          echo "[OK] Release文件下载成功"
+          echo "[OK] A+B压缩包下载成功"
           ls -lh "runtime_inputs/$BUNDLE_NAME"
 
       - name: 解压两个APK
