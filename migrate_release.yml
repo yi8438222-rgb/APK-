@@ -1,0 +1,158 @@
+name: PES2021 CN功能合并
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release标签，例如 v1.0'
+        required: true
+        default: 'v1.0'
+        type: string
+      bundle_name:
+        description: 'Release里的A+B压缩包文件名'
+        required: true
+        default: 'source_apks.zip'
+        type: string
+      strict:
+        description: '严格模式：发现冲突/验收失败就停止'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: 检查项目文件
+        run: |
+          set -euo pipefail
+          test -f scripts/pipeline.py
+          test -f config/targets.json
+          test -f config/translation_map.json
+          echo '[OK] 项目文件完整'
+
+      - name: 从Release下载A+B压缩包
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p runtime_inputs bundle_unpack
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$BUNDLE_NAME" \
+            --clobber \
+            --dir runtime_inputs
+          test -f "runtime_inputs/$BUNDLE_NAME"
+          echo '[OK] Release文件下载成功'
+          ls -lh "runtime_inputs/$BUNDLE_NAME"
+
+      - name: 解压两个APK
+        env:
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+        run: |
+          set -euo pipefail
+          unzip -o "runtime_inputs/$BUNDLE_NAME" -d bundle_unpack >/dev/null
+
+          BASE_FILE=$(find bundle_unpack -type f -name 'base_ability.apk' -print -quit)
+          CN_FILE=$(find bundle_unpack -type f -name 'cn_source.apk' -print -quit)
+
+          test -n "$BASE_FILE" || { echo 'ERROR: ZIP里找不到 base_ability.apk'; exit 1; }
+          test -n "$CN_FILE" || { echo 'ERROR: ZIP里找不到 cn_source.apk'; exit 1; }
+
+          cp "$BASE_FILE" runtime_inputs/base_ability.apk
+          cp "$CN_FILE" runtime_inputs/cn_source.apk
+          cp config/translation_map.json runtime_inputs/translation_map.json
+
+          echo '[OK] A = base_ability.apk'
+          echo '[OK] B = cn_source.apk'
+          ls -lh runtime_inputs/*.apk runtime_inputs/translation_map.json
+          sha256sum runtime_inputs/base_ability.apk runtime_inputs/cn_source.apk runtime_inputs/translation_map.json
+
+      - name: 安装Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装Android SDK工具
+        uses: android-actions/setup-android@v3
+
+      - name: 安装构建工具
+        run: |
+          sdkmanager "platform-tools" "build-tools;35.0.0"
+          pip install -r requirements.txt
+
+      - name: 下载Apktool
+        run: |
+          mkdir -p tools
+          curl -fL --retry 3 \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar \
+            -o tools/apktool.jar
+          java -jar tools/apktool.jar --version
+
+      - name: 准备签名密钥
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > /tmp/release.keystore
+            echo "RELEASE_KEYSTORE=/tmp/release.keystore" >> "$GITHUB_ENV"
+            echo '[INFO] 使用GitHub Secret中的正式签名密钥'
+          else
+            echo "RELEASE_KEYSTORE=" >> "$GITHUB_ENV"
+            echo '[INFO] 未设置正式签名密钥，将使用临时CI测试签名'
+          fi
+
+      - name: 执行APK合并
+        env:
+          STRICT: ${{ inputs.strict }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python scripts/pipeline.py \
+            --base runtime_inputs/base_ability.apk \
+            --cn runtime_inputs/cn_source.apk \
+            --translation runtime_inputs/translation_map.json \
+            --out out \
+            --apktool tools/apktool.jar \
+            --build-tools "$ANDROID_HOME/build-tools/35.0.0" \
+            --strict "$STRICT" \
+            --keystore "${RELEASE_KEYSTORE:-}" \
+            --ks-alias "${KS_ALIAS:-androiddebugkey}" \
+            --ks-pass "${KS_PASS:-android}" \
+            --key-pass "${KEY_PASS:-android}"
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PES2021-CN合并结果-${{ github.run_number }}
+          path: |
+            out/PES2021_5.3.0_能力值版_CN功能_中文版.apk
+            out/verification_report.json
+            out/merge_report.json
+            out/class_conflicts.txt
+            out/final_apk_sha256.txt
+            out/analysis/
+          if-no-files-found: warn
+          retention-days: 14
